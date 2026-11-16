@@ -1,0 +1,66 @@
+#!/bin/bash
+# nrget - download the flows from a Node-RED server
+#
+# usage: nrget <server[:port]> [flows.json]
+#   e.g. nrget 192.168.1.44:1881
+#        nrget 192.168.1.42:1881 barn-flows.json
+#
+# Port defaults to 1881 (Venus OS Node-RED). HTTPS (self-signed certs accepted,
+# as on a Cerbo) is tried first, then plain HTTP. Prefix the server with
+# http:// or https:// to pin one.
+
+if [ -z "$1" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+  echo "usage: $(basename "$0") <server[:port]> [flows.json]" >&2
+  exit 2
+fi
+
+SERVER="${1%/}"
+FLOWS_FILE="${2:-flows.json}"
+
+case "$SERVER" in
+  http://*)  SCHEMES="http";       HOST="${SERVER#http://}" ;;
+  https://*) SCHEMES="https";      HOST="${SERVER#https://}" ;;
+  *)         SCHEMES="https http"; HOST="$SERVER" ;;
+esac
+case "$HOST" in
+  *:*) ;;
+  *)   HOST="$HOST:1881" ;;
+esac
+
+# Download to a temp file first so a failed fetch never clobbers a good copy
+TMP_FILE="$(mktemp "${FLOWS_FILE}.XXXXXX")" || exit 1
+trap 'rm -f "$TMP_FILE"' EXIT
+
+URL=""
+TRIED=""
+for SCHEME in $SCHEMES; do
+  # Node-RED requires this header to accept API requests -
+  # without it you get the UI HTML instead of JSON.
+  # v1 returns the bare array of nodes: no revision stamp, so the file only
+  # changes when the flows do.
+  HTTP_CODE=$(curl -sk -m 30 \
+    -H "Node-RED-API-Version: v1" \
+    -w "%{http_code}" \
+    -o "$TMP_FILE" \
+    "$SCHEME://$HOST/flows")
+  if [ "$HTTP_CODE" = "200" ] && [ "$(head -c 1 "$TMP_FILE")" = "[" ]; then
+    URL="$SCHEME://$HOST"
+    break
+  fi
+  case "$HTTP_CODE" in
+    000) TRIED="$TRIED  $SCHEME: no connection"$'\n' ;;
+    200) TRIED="$TRIED  $SCHEME: HTTP 200 but the response is not flows JSON"$'\n' ;;
+    401) TRIED="$TRIED  $SCHEME: HTTP 401 (Node-RED requires authentication)"$'\n' ;;
+    *)   TRIED="$TRIED  $SCHEME: HTTP $HTTP_CODE"$'\n' ;;
+  esac
+done
+
+if [ -z "$URL" ]; then
+  echo "ERROR: Could not fetch flows from Node-RED at $HOST" >&2
+  printf '%s' "$TRIED" >&2
+  exit 1
+fi
+
+mv "$TMP_FILE" "$FLOWS_FILE" || exit 1
+trap - EXIT
+echo "Saved flows from $URL to $FLOWS_FILE ($(wc -c < "$FLOWS_FILE" | tr -d ' ') bytes)"

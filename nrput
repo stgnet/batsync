@@ -1,0 +1,111 @@
+#!/bin/bash
+# nrput - upload and deploy flows to a Node-RED server
+#
+# usage: nrput <server[:port]> [flows.json]
+#   e.g. nrput 192.168.1.44:1881
+#        nrput 192.168.1.42:1881 barn-flows.json
+#
+# Port defaults to 1881 (Venus OS Node-RED). HTTPS (self-signed certs accepted,
+# as on a Cerbo) is tried first, then plain HTTP. Prefix the server with
+# http:// or https:// to pin one.
+#
+# This REPLACES whatever flows are on the server with the contents of the file.
+
+if [ -z "$1" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+  echo "usage: $(basename "$0") <server[:port]> [flows.json]" >&2
+  exit 2
+fi
+
+SERVER="${1%/}"
+FLOWS_FILE="${2:-flows.json}"
+
+if [ ! -f "$FLOWS_FILE" ]; then
+  echo "ERROR: Flows file not found: $FLOWS_FILE" >&2
+  exit 1
+fi
+
+case "$SERVER" in
+  http://*)  SCHEMES="http";       HOST="${SERVER#http://}" ;;
+  https://*) SCHEMES="https";      HOST="${SERVER#https://}" ;;
+  *)         SCHEMES="https http"; HOST="$SERVER" ;;
+esac
+case "$HOST" in
+  *:*) ;;
+  *)   HOST="$HOST:1881" ;;
+esac
+
+# Accept either a bare array of nodes (as nrget saves) or a v2 export
+# ({"flows":[...],"rev":"..."}). A v2 file's rev would make Node-RED reject the
+# upload if the server has changed since, so it is sent as the bare array.
+case "$(head -c 1 "$FLOWS_FILE")" in
+  "[")
+    SEND_FILE="$FLOWS_FILE"
+    ;;
+  "{")
+    SEND_FILE="$(mktemp)" || exit 1
+    trap 'rm -f "$SEND_FILE"' EXIT
+    python3 -c '
+import json, sys
+json.dump(json.load(open(sys.argv[1]))["flows"], open(sys.argv[2], "w"))
+' "$FLOWS_FILE" "$SEND_FILE" 2>/dev/null || {
+      echo "ERROR: $FLOWS_FILE is not a Node-RED flows file" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "ERROR: $FLOWS_FILE is not a Node-RED flows file" >&2
+    exit 1
+    ;;
+esac
+
+# Find which scheme the server answers on with a harmless read, so the upload
+# itself is only ever sent once.
+URL=""
+TRIED=""
+for SCHEME in $SCHEMES; do
+  HTTP_CODE=$(curl -sk -m 30 \
+    -H "Node-RED-API-Version: v1" \
+    -w "%{http_code}" \
+    -o /dev/null \
+    "$SCHEME://$HOST/flows")
+  if [ "$HTTP_CODE" = "200" ]; then
+    URL="$SCHEME://$HOST"
+    break
+  fi
+  case "$HTTP_CODE" in
+    000) TRIED="$TRIED  $SCHEME: no connection"$'\n' ;;
+    401) TRIED="$TRIED  $SCHEME: HTTP 401 (Node-RED requires authentication)"$'\n' ;;
+    *)   TRIED="$TRIED  $SCHEME: HTTP $HTTP_CODE"$'\n' ;;
+  esac
+done
+
+if [ -z "$URL" ]; then
+  echo "ERROR: Could not reach Node-RED at $HOST" >&2
+  printf '%s' "$TRIED" >&2
+  exit 1
+fi
+
+echo "Pushing $FLOWS_FILE to Node-RED at $URL..."
+
+HTTP_CODE=$(curl -sk -m 60 \
+  -X POST \
+  -H "Node-RED-API-Version: v1" \
+  -H "Content-Type: application/json" \
+  -w "%{http_code}" \
+  -o /dev/null \
+  "$URL/flows" \
+  --data-binary "@$SEND_FILE")
+
+# 200 = deployed, 204 = no content (also success)
+if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "204" ]]; then
+  echo "Success - flows deployed (HTTP $HTTP_CODE)"
+elif [[ "$HTTP_CODE" == "000" ]]; then
+  echo "ERROR: Connection to $URL failed during upload; flows may not be deployed" >&2
+  exit 1
+elif [[ "$HTTP_CODE" == "400" ]]; then
+  echo "ERROR: Node-RED at $URL rejected $FLOWS_FILE as invalid (HTTP 400)" >&2
+  exit 1
+else
+  echo "ERROR: Unexpected response HTTP $HTTP_CODE from $URL" >&2
+  exit 1
+fi

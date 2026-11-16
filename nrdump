@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""nrdump - render a Node-RED flows file as a standalone HTML page for review
+
+usage: nrdump [flows.json] [output.html]
+  e.g. nrdump blythe.json            -> blythe.html
+       nrdump blythe.json review.html
+
+The page has, for every flow tab, a diagram of the nodes and wires laid out as
+in the Node-RED editor, followed by every node's full settings and code.
+Clicking a node in the diagram jumps to its details. The output is a single
+self-contained file: no scripts, no network access.
+
+Accepts either a bare array of nodes (as nrget saves) or a v2 export
+({"flows":[...]}).
+"""
+import datetime
+import html
+import json
+import math
+import os
+import re
+import sys
+
+# Node fill colours, roughly matching the Node-RED editor palette
+COLORS = {
+    'inject': '#a6bbcf', 'debug': '#87a980', 'function': '#fdd0a2',
+    'change': '#e2d96e', 'switch': '#e2d96e', 'rbe': '#e2d96e',
+    'range': '#e2d96e', 'template': '#f3b567', 'delay': '#e6e0f8',
+    'trigger': '#e6e0f8', 'exec': '#e6e0f8', 'comment': '#ffffff',
+    'mqtt in': '#d8bfd8', 'mqtt out': '#d8bfd8',
+    'http request': '#e7e7ae', 'http in': '#e7e7ae', 'http response': '#e7e7ae',
+    'websocket in': '#e7e7ae', 'websocket out': '#e7e7ae',
+    'tcp in': '#c0c0c0', 'tcp out': '#c0c0c0', 'udp in': '#c0c0c0', 'udp out': '#c0c0c0',
+    'link in': '#dddddd', 'link out': '#dddddd', 'link call': '#dddddd',
+    'catch': '#e49191', 'status': '#94c1d0', 'complete': '#c0edc0',
+    'json': '#debd5c', 'csv': '#debd5c', 'xml': '#debd5c', 'yaml': '#debd5c',
+    'html': '#debd5c', 'split': '#e2d96e', 'join': '#e2d96e', 'sort': '#e2d96e',
+    'batch': '#e2d96e', 'file': '#deb887', 'file in': '#deb887', 'watch': '#deb887',
+}
+DEFAULT_COLOR = '#dddddd'
+VICTRON_IN, VICTRON_OUT = '#4790d0', '#f7ab3e'
+
+# Types with no input port, and types whose icon sits on the right-hand side
+# (which right-aligns the label), as in the Node-RED editor
+NO_INPUT = {'inject', 'mqtt in', 'http in', 'link in', 'catch', 'status',
+            'complete', 'comment', 'tcp in', 'udp in', 'websocket in', 'watch'}
+ICON_RIGHT = {'debug', 'mqtt out', 'http response', 'link out', 'tcp out',
+              'udp out', 'websocket out'}
+# Stand-ins for the editor's icons (the real ones are image files)
+GLYPHS = {'inject': '\u2192', 'debug': '\u2261', 'function': '\u0192',
+          'change': '\u21c4', 'switch': '\u21c9', 'http request': '\u21c5',
+          'link in': '\u2192', 'link out': '\u2192', 'comment': '\u270e',
+          'template': '{', 'json': '{}', 'delay': '\u25f7', 'trigger': '\u2310'}
+
+# Properties that are layout or shown elsewhere, so not repeated in the table
+SKIP_PROPS = {'id', 'type', 'z', 'x', 'y', 'w', 'h', 'wires', 'name', 'g',
+              'd', 'l', 'nodes', 'links', 'label'}
+# Properties shown as code blocks rather than table cells
+CODE_PROPS = ('info', 'func', 'initialize', 'finalize', 'template', 'command')
+
+NODE_H = 30
+MARGIN = 30
+
+esc = html.escape
+
+
+def anchor(prefix, node_id):
+    return prefix + re.sub(r'[^A-Za-z0-9_-]', '_', str(node_id))
+
+
+def node_color(n):
+    t = n['type']
+    if t.startswith('victron-input'):
+        return VICTRON_IN
+    if t.startswith('victron-output'):
+        return VICTRON_OUT
+    if t.startswith('subflow:'):
+        return '#dddddd'
+    return COLORS.get(t, DEFAULT_COLOR)
+
+
+def node_label(n, by_id):
+    """The text Node-RED would show on the node, as near as we can tell."""
+    t = n['type']
+    if n.get('name'):
+        return str(n['name'])
+    if n.get('label') and t in ('tab', 'subflow'):
+        return str(n['label'])
+    if t.startswith('subflow:'):
+        sf = by_id.get(t[8:])
+        return (sf or {}).get('name') or 'subflow'
+    if t == 'inject':
+        pt = n.get('payloadType', 'date')
+        if pt == 'date':
+            text = 'timestamp'
+        elif pt in ('str', 'num', 'bool', 'json') and str(n.get('payload', '')) != '':
+            text = str(n['payload'])
+        else:
+            text = 'inject'
+        if n.get('topic') and len(str(n['topic'])) + len(text) <= 32:
+            text = '%s:%s' % (n['topic'], text)
+        return text + (' \u21bb' if n.get('repeat') or n.get('crontab') else '')
+    if t == 'rbe':
+        return 'filter'
+    if t == 'debug':
+        c = n.get('complete')
+        if c in ('true', True):
+            return 'msg'
+        return 'msg.' + (c if c and c not in ('false', False) else 'payload')
+    if t in ('mqtt in', 'mqtt out'):
+        return str(n.get('topic') or 'mqtt')
+    if t.startswith('victron-'):
+        svc = (n.get('serviceObj') or {}).get('name')
+        path = (n.get('pathObj') or {}).get('name') or n.get('path')
+        parts = [p for p in (svc, path) if p]
+        return ' - '.join(parts) if parts else t
+    if t == 'change':
+        rules = n.get('rules') or []
+        if len(rules) == 1:
+            r = rules[0]
+            verb = {'set': 'set', 'change': 'change', 'delete': 'delete',
+                    'move': 'move'}.get(r.get('t'), 'change')
+            return '%s %s.%s' % (verb, r.get('pt', 'msg'), r.get('p', ''))
+        return 'change: %d rules' % len(rules)
+    if t == 'http request':
+        return str(n.get('url') or 'http request')
+    if t in ('link in', 'link out', 'link call'):
+        return t
+    if t == 'group':
+        return 'group'
+    return t
+
+
+def text_width(text):
+    """Approximate width of a label in the editor's 14px Helvetica/Arial."""
+    w = 0.0
+    for ch in text:
+        if ch in "ijl.,:;'|!":
+            w += 3.5
+        elif ch in ' ftI/\\[]()-r"':
+            w += 4.6
+        elif ch in 'mwMW%@':
+            w += 11.8
+        elif ch.isupper():
+            w += 9.6
+        else:
+            w += 7.8
+    return w
+
+
+def is_victron(n, direction):
+    return n['type'].startswith('victron-%s' % direction)
+
+
+def has_input_port(n, wired_to):
+    if n['id'] in wired_to:
+        return True
+    return n['type'] not in NO_INPUT and not is_victron(n, 'input')
+
+
+def label_hidden(n):
+    if 'l' in n:
+        return n['l'] is False
+    return n['type'] in ('link in', 'link out', 'link call')
+
+
+def node_size(n, label, wired_to=()):
+    """Same rules as the editor: 20px grid, 100 wide minimum, 30 high."""
+    if n['type'] == 'junction':
+        return 10, 10
+    outputs = len(n.get('wires') or [])
+    h = max(NODE_H, outputs * 15)
+    if label_hidden(n):
+        return 30, h
+    pad = 50 + (7 if has_input_port(n, wired_to) else 0)
+    w = max(100, int(math.ceil((text_width(label) + pad) / 20.0)) * 20)
+    return w, h
+
+
+def link_path(ox, oy, dx_, dy_):
+    """Wire shape, following the editor's generateLinkPath()."""
+    nw, nh = 100.0, 30.0
+    dy, dx = dy_ - oy, dx_ - ox
+    delta = math.sqrt(dx * dx + dy * dy)
+    if dx > 0:
+        scale = 0.75
+        if delta < nw:
+            scale = 0.75 - 0.75 * ((nw - delta) / nw)
+        return 'M %.1f %.1f C %.1f %.1f %.1f %.1f %.1f %.1f' % (
+            ox, oy, ox + nw * scale, oy, dx_ - nw * scale, dy_, dx_, dy_)
+    scale = 0.4 - 0.2 * max(0.0, (nw - min(abs(dx), abs(dy))) / nw)
+    mid_x, mid_y = math.floor(dx_ - dx / 2), math.floor(dy_ - dy / 2)
+    if abs(dy) < 10:
+        bottom = max(oy, dy_) + 25
+        sh, eh = bottom - oy, bottom - dy_
+        return ('M %.1f %.1f C %.1f %.1f %.1f %.1f %.1f %.1f C %.1f %.1f %.1f %.1f %.1f %.1f'
+                ' h %.1f C %.1f %.1f %.1f %.1f %.1f %.1f C %.1f %.1f %.1f %.1f %.1f %.1f') % (
+            ox, oy,
+            ox + 15, oy, ox + 25, oy + 5, ox + 25, oy + sh / 2,
+            ox + 25, oy + sh - 5, ox + 15, oy + sh, ox, oy + sh,
+            dx,
+            dx_ - 15, oy + sh, dx_ - 25, oy + sh - 5, dx_ - 25, dy_ + eh / 2,
+            dx_ - 25, dy_ + 5, dx_ - 15, dy_, dx_, dy_)
+    cph = nh / 2
+    y1 = (dy_ + mid_y) / 2.0
+    down = dy > 0
+    scy = 1 if down else -1
+    top_x = ox + nw * scale
+    top_y = min(y1 - dy / 2, oy + cph) if down else max(y1 - dy / 2, oy - cph)
+    bot_x = dx_ - nw * scale
+    bot_y = max(y1, dy_ - cph) if down else min(y1, dy_ + cph)
+    x1 = (ox + top_x) / 2
+    cp = [
+        [x1, oy],
+        [top_x, max(oy, top_y - cph) if down else min(oy, top_y + cph)],
+        [x1, min(mid_y, top_y + cph) if down else max(mid_y, top_y - cph)],
+        [bot_x, max(mid_y, bot_y - cph) if down else min(mid_y, bot_y + cph)],
+        [(dx_ + bot_x) / 2, dy_],
+    ]
+    if cp[2][1] == top_y + scy * cph:
+        if abs(dy) < cph * 10:
+            cp[1][1] = top_y - scy * cph / 2
+            cp[3][1] = bot_y - scy * cph / 2
+        cp[2][0] = top_x
+    return ('M %.1f %.1f C %.1f %.1f %.1f %.1f %.1f %.1f S %.1f %.1f %.1f %.1f'
+            ' S %.1f %.1f %.1f %.1f S %.1f %.1f %.1f %.1f') % (
+        ox, oy, cp[0][0], cp[0][1], cp[1][0], cp[1][1], top_x, top_y,
+        cp[2][0], cp[2][1], mid_x, mid_y, cp[3][0], cp[3][1], bot_x, bot_y,
+        cp[4][0], cp[4][1], dx_, dy_)
+
+
+def fmt_value(v, by_id, labels):
+    """Render a property value; a value that is another node's id becomes a link."""
+    if isinstance(v, str):
+        if v in by_id:
+            return '<a href="#%s">%s</a> <span class="dim">(%s, id %s)</span>' % (
+                anchor('n-', v), esc(labels[v]), esc(by_id[v]['type']), esc(v))
+        if '\n' in v:
+            return '<pre>%s</pre>' % esc(v)
+        return esc(v) if v != '' else '<span class="dim">(empty)</span>'
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    if isinstance(v, (int, float)) or v is None:
+        return esc(json.dumps(v))
+    return '<pre>%s</pre>' % esc(json.dumps(v, indent=2, ensure_ascii=False))
+
+
+def render_diagram(nodes, groups, by_id, labels):
+    if not nodes and not groups:
+        return '<p class="dim">No nodes on this flow.</p>'
+    wired_to = set()
+    for n in nodes:
+        for port in n.get('wires') or []:
+            wired_to.update(port)
+    geo = {}
+    for n in nodes:
+        w, h = node_size(n, labels[n['id']], wired_to)
+        geo[n['id']] = (float(n.get('x', 0)), float(n.get('y', 0)), w, h)
+
+    # extents, leaving room for the inject/debug buttons that overhang a node
+    xs1 = [x + w / 2 + 30 for x, y, w, h in geo.values()] + [g.get('x', 0) + g.get('w', 0) for g in groups]
+    ys1 = [y + h / 2 for x, y, w, h in geo.values()] + [g.get('y', 0) + g.get('h', 0) for g in groups]
+    # like the editor, the canvas starts at 0,0 so nodes keep their grid position
+    width = int(math.ceil((max(xs1) + MARGIN) / 20.0)) * 20
+    height = int(math.ceil((max(ys1) + MARGIN + 30) / 20.0)) * 20
+
+    out = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
+           'viewBox="0 0 %d %d" role="img">' % (width, height, width, height)]
+
+    for g in groups:
+        style = g.get('style') or {}
+        out.append('<rect class="group" x="%s" y="%s" width="%s" height="%s" rx="4" '
+                   'fill="%s" fill-opacity="%s" stroke="%s"/>' % (
+                       g.get('x', 0), g.get('y', 0), g.get('w', 0), g.get('h', 0),
+                       esc(str(style.get('fill') or 'none')), esc(str(style.get('fill-opacity', 1))),
+                       esc(str(style.get('stroke') or '#a4a4a4'))))
+        if g.get('name') and style.get('label'):
+            out.append('<text class="grouplabel" x="%s" y="%s">%s</text>' % (
+                g.get('x', 0) + 5, g.get('y', 0) + 16, esc(str(g['name']))))
+
+    # wires first so nodes draw on top of them
+    for n in nodes:
+        x, y, w, h = geo[n['id']]
+        ports = n.get('wires') or []
+        for i, port in enumerate(ports):
+            py = y + (i - (len(ports) - 1) / 2.0) * 13
+            for tid in port:
+                if tid not in geo:
+                    continue
+                tx, ty, tw, th = geo[tid]
+                out.append('<path class="wire%s" d="%s"/>' % (
+                    ' disabled' if n.get('d') or by_id[tid].get('d') else '',
+                    link_path(x + w / 2, py, tx - tw / 2, ty)))
+
+    for n in nodes:
+        nid, t = n['id'], n['type']
+        x, y, w, h = geo[nid]
+        left, top = x - w / 2, y - h / 2
+        label = labels[nid]
+        color = node_color(n)
+        cls = 'node' + (' disabled' if n.get('d') else '')
+        out.append('<a href="#%s"><g class="%s" id="%s">' % (anchor('n-', nid), cls, anchor('d-', nid)))
+        out.append('<title>%s (%s)</title>' % (esc(label), esc(t)))
+        if t == 'junction':
+            out.append('<rect class="body" x="%.1f" y="%.1f" width="10" height="10" rx="2" fill="#d9d9d9"/>' % (left, top))
+            out.append('</g></a>')
+            continue
+        right_icon = t in ICON_RIGHT or is_victron(n, 'output')
+        # trigger button overhanging the node: left of an inject, right of a debug
+        if t == 'inject':
+            out.append('<rect class="btnbg" x="%.1f" y="%.1f" width="32" height="%d" rx="5"/>' % (left - 25, top + 2, h - 4))
+            out.append('<rect class="btn" x="%.1f" y="%.1f" width="16" height="%d" rx="4" fill="%s"/>' % (left - 20, top + 6, h - 12, color))
+        elif t == 'debug':
+            out.append('<rect class="btnbg" x="%.1f" y="%.1f" width="32" height="%d" rx="5"/>' % (left + w - 7, top + 2, h - 4))
+            out.append('<rect class="btn" x="%.1f" y="%.1f" width="16" height="%d" rx="4" fill="%s"/>' % (
+                left + w + 4, top + 6, h - 12, color if n.get('active', True) else '#eee'))
+        out.append('<rect class="body" x="%.1f" y="%.1f" width="%d" height="%d" rx="5" fill="%s"/>' % (left, top, w, h, color))
+        # shaded icon strip
+        ix = left + w - 30 if right_icon else left
+        clip = anchor('c-', nid)
+        out.append('<clipPath id="%s"><rect x="%.1f" y="%.1f" width="%d" height="%d" rx="5"/></clipPath>' % (clip, left, top, w, h))
+        out.append('<rect class="iconbg" x="%.1f" y="%.1f" width="30" height="%d" clip-path="url(#%s)"/>' % (ix, top, h, clip))
+        if w > 30:
+            sx = ix if right_icon else ix + 30
+            out.append('<path class="iconsep" d="M%.1f %.1f v%d"/>' % (sx, top + 1, h - 2))
+        glyph = GLYPHS.get(t) or ('V' if t.startswith('victron-') else '')
+        if glyph:
+            out.append('<text class="glyph%s" x="%.1f" y="%.1f">%s</text>' % (
+                ' dark' if color.lower() in ('#ffffff', '#fff') else '', ix + 15, y + 6, esc(glyph)))
+        if not label_hidden(n):
+            if right_icon:
+                out.append('<text class="label right" x="%.1f" y="%.1f">%s</text>' % (left + w - 38, y + 5, esc(label)))
+            else:
+                out.append('<text class="label" x="%.1f" y="%.1f">%s</text>' % (left + 38, y + 5, esc(label)))
+        ports = n.get('wires') or []
+        for i in range(len(ports)):
+            py = y + (i - (len(ports) - 1) / 2.0) * 13
+            out.append('<rect class="port" x="%.1f" y="%.1f" width="10" height="10" rx="3"/>' % (left + w - 5, py - 5))
+        if has_input_port(n, wired_to):
+            out.append('<rect class="port" x="%.1f" y="%.1f" width="10" height="10" rx="3"/>' % (left - 5, y - 5))
+        out.append('</g></a>')
+    out.append('</svg>')
+    return '<div class="canvas">%s</div>' % ''.join(out)
+
+
+def render_node(n, by_id, labels, incoming, in_diagram=True):
+    nid = n['id']
+    out = ['<section class="nd%s" id="%s">' % (' disabled' if n.get('d') else '', anchor('n-', nid))]
+    out.append('<h3><span class="chip" style="background:%s"></span>%s '
+               '<span class="type">%s</span>%s</h3>' % (
+                   node_color(n), esc(labels[nid]), esc(n['type']),
+                   ' <span class="badge">disabled</span>' if n.get('d') else ''))
+    meta = ['id <code>%s</code>' % esc(nid)]
+    if in_diagram:
+        meta.append('<a href="#%s">show in diagram</a>' % anchor('d-', nid))
+    out.append('<p class="meta">%s</p>' % ' &middot; '.join(meta))
+
+    def links(ids):
+        return ', '.join(
+            '<a href="#%s">%s</a>' % (anchor('n-', i), esc(labels.get(i, i))) if i in by_id
+            else '<span class="dim">%s (missing)</span>' % esc(i) for i in ids)
+
+    rows = []
+    if incoming.get(nid):
+        rows.append(('receives from', links(incoming[nid])))
+    ports = n.get('wires') or []
+    for i, port in enumerate(ports):
+        name = 'sends to' if len(ports) == 1 else 'output %d sends to' % (i + 1)
+        rows.append((name, links(port) if port else '<span class="dim">(not connected)</span>'))
+    if n.get('links'):
+        rows.append(('linked to', links(n['links'])))
+    if n.get('g') and n['g'] in by_id:
+        rows.append(('group', esc(labels[n['g']])))
+    code = []
+    for k, v in n.items():
+        if k in SKIP_PROPS:
+            continue
+        if k in CODE_PROPS and isinstance(v, str):
+            if v.strip():
+                code.append((k, v))
+            continue
+        rows.append((esc(k), fmt_value(v, by_id, labels)))
+    if rows:
+        out.append('<table>%s</table>' % ''.join(
+            '<tr><th>%s</th><td>%s</td></tr>' % r for r in rows))
+    for k, v in code:
+        out.append('<h4>%s</h4><pre class="code">%s</pre>' % (esc(k), esc(v)))
+    out.append('</section>')
+    return ''.join(out)
+
+
+CSS = """
+:root{--bg:#f6f6f4;--panel:#fff;--text:#1f2328;--dim:#6b7280;--line:#d9d9d6;
+--canvas:#fff;--wire:#8a8f98;--accent:#d9480f;--code:#f3f3f0;--link:#0b5fbd}
+@media (prefers-color-scheme:dark){:root{--bg:#16181b;--panel:#1e2125;--text:#e4e6ea;
+--dim:#9aa1ab;--line:#33383f;--canvas:#23272c;--wire:#7d8590;--accent:#ff922b;
+--code:#16181b;--link:#6cb0ff}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);
+font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+a{color:var(--link)}
+header.top{position:sticky;top:0;z-index:5;background:var(--panel);
+border-bottom:1px solid var(--line);padding:8px 16px;display:flex;flex-wrap:wrap;
+gap:6px 16px;align-items:baseline}
+header.top strong{font-size:16px}
+header.top nav{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:14px}
+main{padding:8px 16px 60px}
+.summary{color:var(--dim);font-size:14px;margin:8px 0 0}
+h2{margin:36px 0 6px;font-size:22px;scroll-margin-top:60px}
+h3{margin:0;font-size:16px}
+h4{margin:12px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+.info{white-space:pre-wrap;color:var(--dim);margin:0 0 10px;max-width:900px}
+.canvas{overflow:auto;background:linear-gradient(#eee 1px,transparent 1px) 0 -1px/20px 20px,
+linear-gradient(90deg,#eee 1px,transparent 1px) -1px 0/20px 20px;background-color:#fff;border:1px solid var(--line);
+border-radius:6px;margin:10px 0 18px;max-height:85vh}
+.canvas svg{display:block}
+.wire{fill:none;stroke:#999;stroke-width:3;stroke-linecap:round}
+.wire.disabled{stroke-dasharray:8 3;stroke-width:2;stroke:#ccc}
+.group{stroke-width:2}
+.grouplabel{font:14px "Helvetica Neue",Arial,Helvetica,sans-serif;fill:#a4a4a4}
+.node .body{stroke:#999;stroke-width:1}
+.node text{pointer-events:none}
+.node .label{font:14px "Helvetica Neue",Arial,Helvetica,sans-serif;fill:#333}
+.node .label.right{text-anchor:end}
+.node .glyph{font:16px "Helvetica Neue",Arial,Helvetica,sans-serif;fill:#fff;
+fill-opacity:.9;text-anchor:middle}
+.node .glyph.dark{fill:#999}
+.node .iconbg{fill:#000;fill-opacity:.05}
+.node .iconsep{stroke:#000;stroke-opacity:.1;fill:none}
+.node .port{fill:#d9d9d9;stroke:#999}
+.node .btnbg{fill:#eee;stroke:#999}
+.node .btn{stroke:#999}
+.node.disabled{opacity:.5}
+.node.disabled .body{stroke-dasharray:8 3;fill-opacity:.5}
+.node:hover .body{stroke:#ff7f0e;stroke-width:2}
+.node:target .body{stroke:#ff7f0e;stroke-width:3}
+.canvas a{text-decoration:none}
+.nodes{max-width:1100px}
+.nd{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+padding:12px 14px;margin:10px 0;scroll-margin-top:60px}
+.nd:target{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+.nd.disabled h3{color:var(--dim)}
+.chip{display:inline-block;width:12px;height:12px;border-radius:3px;
+border:1px solid #7b7b7b;margin-right:7px;vertical-align:-1px}
+.type{font-weight:400;color:var(--dim);font-size:13px;margin-left:6px}
+.badge{font-size:11px;font-weight:600;border:1px solid var(--line);border-radius:10px;
+padding:1px 7px;color:var(--dim);margin-left:6px}
+.meta{margin:2px 0 8px;font-size:13px;color:var(--dim)}
+.dim{color:var(--dim)}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;vertical-align:top;padding:3px 10px 3px 0;border-top:1px solid var(--line)}
+th{font-weight:500;color:var(--dim);white-space:nowrap;width:1%}
+td{overflow-wrap:anywhere}
+pre,code{font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}
+pre.code{background:var(--code);border:1px solid var(--line);border-radius:4px;
+padding:10px;white-space:pre;overflow:auto;max-height:70vh;tab-size:4}
+"""
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ('-h', '--help'):
+        sys.stderr.write(__doc__)
+        return 2
+    if len(args) > 2:
+        sys.stderr.write('usage: nrdump [flows.json] [output.html]\n')
+        return 2
+    src = args[0] if args else 'flows.json'
+    dst = args[1] if len(args) > 1 else os.path.splitext(src)[0] + '.html'
+    if os.path.abspath(dst) == os.path.abspath(src):
+        dst = src + '.html'
+
+    try:
+        with open(src, encoding='utf-8') as f:
+            data = json.load(f)
+    except OSError as e:
+        sys.stderr.write('ERROR: Cannot read %s: %s\n' % (src, e.strerror))
+        return 1
+    except ValueError as e:
+        sys.stderr.write('ERROR: %s is not valid JSON: %s\n' % (src, e))
+        return 1
+    if isinstance(data, dict):
+        data = data.get('flows')
+    if not isinstance(data, list) or not all(isinstance(n, dict) and 'id' in n and 'type' in n for n in data):
+        sys.stderr.write('ERROR: %s is not a Node-RED flows file\n' % src)
+        return 1
+
+    by_id = {n['id']: n for n in data}
+    labels = {n['id']: node_label(n, by_id) for n in data}
+    incoming = {}
+    for n in data:
+        for port in n.get('wires') or []:
+            for tid in port:
+                incoming.setdefault(tid, []).append(n['id'])
+
+    containers = [n for n in data if n['type'] in ('tab', 'subflow')]
+    container_ids = {n['id'] for n in containers}
+    config = [n for n in data if n['type'] not in ('tab', 'subflow') and n.get('z') not in container_ids]
+
+    body, nav = [], []
+    for c in containers:
+        members = [n for n in data if n.get('z') == c['id']]
+        groups = [n for n in members if n['type'] == 'group']
+        drawn = [n for n in members if n['type'] != 'group' and 'x' in n and 'y' in n]
+        listed = sorted((n for n in members if n['type'] not in ('group', 'junction')),
+                        key=lambda n: (round(n.get('y', 0) / 40.0), n.get('x', 0)))
+        kind = 'Subflow' if c['type'] == 'subflow' else 'Flow'
+        title = labels[c['id']]
+        cid = anchor('n-', c['id'])
+        nav.append('<a href="#%s">%s</a>' % (cid, esc(title)))
+        body.append('<h2 id="%s">%s <span class="type">%s &middot; %d nodes%s</span></h2>' % (
+            cid, esc(title), kind, len(listed), ' &middot; disabled' if c.get('disabled') else ''))
+        if c.get('info'):
+            body.append('<p class="info">%s</p>' % esc(str(c['info'])))
+        body.append(render_diagram(drawn, groups, by_id, labels))
+        drawn_ids = {n['id'] for n in drawn}
+        body.append('<div class="nodes">%s</div>' % ''.join(
+            render_node(n, by_id, labels, incoming, n['id'] in drawn_ids) for n in listed))
+    if config:
+        nav.append('<a href="#config">Configuration nodes</a>')
+        body.append('<h2 id="config">Configuration nodes <span class="type">%d nodes</span></h2>' % len(config))
+        body.append('<div class="nodes">%s</div>' % ''.join(
+            render_node(n, by_id, labels, incoming, False) for n in config))
+
+    name = os.path.basename(src)
+    when = datetime.datetime.fromtimestamp(os.path.getmtime(src)).strftime('%Y-%m-%d %H:%M')
+    summary = '%d flows, %d nodes, %d configuration nodes &middot; file dated %s' % (
+        len(containers), len(data) - len(containers) - len(config), len(config), when)
+    page = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>%s - Node-RED flows</title><style>%s</style></head><body>'
+            '<header class="top"><strong>%s</strong><nav>%s</nav></header>'
+            '<main><p class="summary">%s</p>%s</main></body></html>\n') % (
+                esc(name), CSS, esc(name), ''.join(nav), summary, ''.join(body))
+
+    try:
+        with open(dst, 'w', encoding='utf-8') as f:
+            f.write(page)
+    except OSError as e:
+        sys.stderr.write('ERROR: Cannot write %s: %s\n' % (dst, e.strerror))
+        return 1
+    print('Wrote %s (%d flows, %d nodes)' % (dst, len(containers), len(data) - len(containers)))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,3 @@
+# Raw Cerbo MQTT dumps: contain GPS position, device serials and pairing codes
+captures/cerbo-*.json
+.DS_Store
